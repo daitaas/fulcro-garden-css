@@ -13,25 +13,43 @@
   #?(:cljs (apply js/console.log msg)
      :clj  (.println System/err (apply str msg))))
 
-(defn component-css-includes-with-depth [{:keys [component state-map traverse] :as context} cache breadth depth]
-  (let [includes-cache @cache
+(declare traverse-eql-ast)
+(defn traverse-css-includes [{:keys [state-map breadth_ incl-cache_] :as context} component depth]
+  (let [includes-cache @incl-cache_
         css-includes (remove (fn [component]
-                           (contains? includes-cache (comp/component-name component)))
-                         (css/get-includes component))]
-    (swap! cache into (keep comp/component-name css-includes))
+                               (contains? includes-cache (comp/component-name component)))
+                             (css/get-includes component))]
+    (swap! incl-cache_ into (keep comp/component-name css-includes))
     (let [ast-includes (mapcat (fn [component]
                                  (if-let [query (if (map? state-map) (comp/get-query component state-map) (comp/get-query component))]
-                                   (traverse (eql/query->ast query) depth)
+                                   (traverse-eql-ast context (eql/query->ast query) (inc depth))
                                    []))
                                css-includes)]
       (-> (into []
                 (map #(hash-map
                        ::depth (inc depth)
-                       ::breadth breadth
+                       ::breadth @breadth_
                        ::component %))
                 css-includes)
-          (into (mapcat #(component-css-includes-with-depth (assoc context :component %) cache breadth (inc depth)) css-includes))
+          (into (mapcat #(traverse-css-includes context % (inc depth)) css-includes))
           (into ast-includes)))))
+
+(defn traverse-eql-ast
+  [{:keys [query-cache_ breadth_] :as context}
+   {:keys [children component]}
+   depth]
+  (if (contains? @query-cache_ (comp/component-name component))
+    []
+    (let [includes (into
+                    (cond-> []
+                      (and component (css/CSS? component)) (conj {::depth     depth
+                                                                  ::breadth   (swap! breadth_ inc)
+                                                                  ::component component})
+                      component (into (traverse-css-includes context component depth)))
+                    (mapcat (fn [child]
+                              (traverse-eql-ast context child (inc depth))) (seq children)))]
+      (when-let [cname (comp/component-name component)] (swap! query-cache_ conj cname))
+      includes)))
 
 (defn find-css-nodes
   "Scan the given component and return an ordered vector of the css rules in depth-first order.
@@ -39,27 +57,11 @@
   [{:keys [component order state-map]}]
   (let [query         (if (map? state-map) (comp/get-query component state-map) (comp/get-query component))
         ast           (eql/query->ast query)
-        breadth       (atom 0)
-        query-cache   (atom #{})
-        incl-cache    (atom #{})
-        traverse      (fn traverse* [{:keys [children component]} depth]
-                        (if (contains? @query-cache (comp/component-name component))
-                          []
-                          (let [includes (into
-                                          (cond-> []
-                                                  (and component (css/CSS? component)) (conj {::depth depth
-                                                                                              ::breadth (swap! breadth inc)
-                                                                                              ::component component})
-                                                  component (into (component-css-includes-with-depth
-                                                                   {:component component
-                                                                    :traverse traverse*
-                                                                    :state-map state-map}
-                                                                   incl-cache @breadth depth)))
-                                          (mapcat (fn [child]
-                                                    (traverse* child (inc depth))) (seq children)))]
-                            (when (comp/component-name component) (swap! query-cache conj (comp/component-name component)))
-                            includes)))
-        nodes          (traverse ast 0)
+        nodes         (traverse-eql-ast {:breadth_     (atom 0)
+                                         :query-cache_ (atom #{})
+                                         :incl-cache_  (atom #{})
+                                         :state-map    state-map}
+                            ast 0)
         ordered-nodes  (if (= order :breadth-first)
                           (sort-by ::breadth nodes)
                           (sort-by #(- (::depth %)) nodes))
